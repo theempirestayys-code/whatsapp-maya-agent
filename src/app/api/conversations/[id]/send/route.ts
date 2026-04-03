@@ -11,9 +11,10 @@ const WHATSAPP_PHONE_NUMBER_ID = process.env.WHATSAPP_PHONE_NUMBER_ID!;
 
 export async function POST(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const { id } = await params;
     const { message } = await req.json();
     if (!message?.trim()) {
       return NextResponse.json({ error: 'Message is required' }, { status: 400 });
@@ -21,7 +22,7 @@ export async function POST(
     const { data: conversation, error: convError } = await supabase
       .from('conversations')
       .select('*')
-      .eq('id', params.id)
+      .eq('id', id)
       .single();
     if (convError || !conversation) {
       return NextResponse.json({ error: 'Conversation not found' }, { status: 404 });
@@ -48,7 +49,7 @@ export async function POST(
       return NextResponse.json({ error: 'Failed to send', details: waData }, { status: 500 });
     }
     await supabase.from('messages').insert({
-      conversation_id: params.id,
+      conversation_id: id,
       role: 'assistant',
       content: message.trim(),
       whatsapp_message_id: waData?.messages?.[0]?.id,
@@ -58,9 +59,9 @@ export async function POST(
     await supabase.from('conversations').update({
       last_message_at: new Date().toISOString(),
       updated_at: new Date().toISOString(),
-    }).eq('id', params.id);
+    }).eq('id', id);
     return NextResponse.json({ success: true, messageId: waData?.messages?.[0]?.id });
-  } catch (err) {
+  } catch {
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
