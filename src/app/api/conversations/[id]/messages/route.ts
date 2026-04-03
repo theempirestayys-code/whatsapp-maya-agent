@@ -8,15 +8,16 @@ const supabase = createClient(
 
 export async function GET(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const { id } = await params;
     const { searchParams } = req.nextUrl;
     const limit = parseInt(searchParams.get('limit') || '100');
     const { data, error } = await supabase
       .from('messages')
       .select('*')
-      .eq('conversation_id', params.id)
+      .eq('conversation_id', id)
       .order('created_at', { ascending: true })
       .limit(limit);
     if (error) return NextResponse.json({ error: error.message }, { status: 500 });
