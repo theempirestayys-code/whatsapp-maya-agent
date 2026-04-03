@@ -8,26 +8,28 @@ const supabase = createClient(
 
 export async function GET(
   _req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const { id } = await params;
     const { data, error } = await supabase
       .from('conversations')
       .select('*')
-      .eq('id', params.id)
+      .eq('id', id)
       .single();
     if (error) return NextResponse.json({ error: error.message }, { status: 404 });
     return NextResponse.json({ conversation: data });
-  } catch (err) {
+  } catch {
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
 }
 
 export async function PATCH(
   req: NextRequest,
-  { params }: { params: { id: string } }
+  { params }: { params: Promise<{ id: string }> }
 ) {
   try {
+    const { id } = await params;
     const body = await req.json();
     const allowed = ['status', 'guest_name', 'notes'];
     const updates: Record<string, unknown> = {};
@@ -38,12 +40,12 @@ export async function PATCH(
     const { data, error } = await supabase
       .from('conversations')
       .update(updates)
-      .eq('id', params.id)
+      .eq('id', id)
       .select()
       .single();
     if (error) return NextResponse.json({ error: error.message }, { status: 400 });
     return NextResponse.json({ conversation: data });
-  } catch (err) {
+  } catch {
     return NextResponse.json({ error: 'Internal server error' }, { status: 500 });
   }
-           }
+}
