@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
+import crypto from 'crypto';
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
@@ -12,7 +13,14 @@ const WHATSAPP_VERIFY_TOKEN = process.env.WHATSAPP_VERIFY_TOKEN!;
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY!;
 const AI_MODEL = process.env.AI_MODEL || 'anthropic/claude-sonnet-4-5';
 
-const MAYA_SYSTEM_PROMPT = `You are Maya, the 24/7 AI guest communication agent for The Empire Stays — a premium short-term rental portfolio in Mumbai and Thane, India. Be warm, professional, concise. Never guarantee refunds or availability without verification. Escalate damage claims, safety emergencies, legal threats to the human host team immediately.`;
+const MAYA_SYSTEM_PROMPT = 'You are Maya, the 24/7 AI guest communication agent for The Empire Stays. Be warm, professional, concise. Never guarantee refunds or availability without verification. Escalate damage claims and safety emergencies to the human host team immediately.';
+
+function verifySignature(body: string, signature: string): boolean {
+  const appSecret = process.env.WHATSAPP_APP_SECRET;
+  if (!appSecret) { return true; }
+  const expected = 'sha256=' + crypto.createHmac('sha256', appSecret).update(body).digest('hex');
+  try { return crypto.timingSafeEqual(Buffer.from(signature), Buffer.from(expected)); } catch { return false; }
+}
 
 export async function GET(req: NextRequest) {
   const searchParams = req.nextUrl.searchParams;
@@ -27,156 +35,103 @@ export async function GET(req: NextRequest) {
 
 export async function POST(req: NextRequest) {
   try {
-    const body = await req.json();
+    const rawBody = await req.text();
+    const signature = req.headers.get('x-hub-signature-256') || '';
+    if (signature && !verifySignature(rawBody, signature)) {
+      return new NextResponse('Unauthorized', { status: 401 });
+    }
+    const body = JSON.parse(rawBody);
     const messages = body?.entry?.[0]?.changes?.[0]?.value?.messages;
     if (!messages?.length) return NextResponse.json({ status: 'ok' });
-
     const message = messages[0];
     const from = message.from as string;
     const messageId = message.id as string;
     const timestamp = message.timestamp as string;
-
+    const contactName = body?.entry?.[0]?.changes?.[0]?.value?.contacts?.[0]?.profile?.name || '';
     await markMessageRead(messageId);
-
     if (message.type !== 'text') {
-      await sendWhatsAppMessage(from, "Hi! Please type your question and I will help you right away!");
+      await sendWhatsAppMessage(from, 'Hi! Please type your question and I will help you right away!');
       return NextResponse.json({ status: 'ok' });
     }
-
     const text = message.text?.body as string;
     if (!text?.trim()) return NextResponse.json({ status: 'ok' });
-
-    let { data: conversation } = await supabase
+    const { data: conversation, error: convError } = await supabase
       .from('conversations')
-      .select('*')
-      .eq('guest_phone', from)
-      .maybeSingle();
-
-    if (!conversation) {
-      const { data: newConv } = await supabase
-        .from('conversations')
-        .insert({
-          guest_phone: from,
-          status: 'active',
-          created_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
-        .select()
-        .single();
-      conversation = newConv;
-    }
-
+      .upsert(
+        { phone_number: from, contact_name: contactName, mode: 'agent', updated_at: new Date().toISOString() },
+        { onConflict: 'phone_number', ignoreDuplicates: false }
+      )
+      .select().single();
+    if (convError) console.error('[Maya] Conversation upsert error:', convError);
     const conversationId = conversation?.id;
-
+    if (conversation?.mode === 'human') {
+      return NextResponse.json({ status: 'ok' });
+    }
     if (conversationId) {
       await supabase.from('messages').insert({
         conversation_id: conversationId,
+        phone_number: from,
         role: 'user',
         content: text,
         whatsapp_message_id: messageId,
         created_at: new Date(parseInt(timestamp) * 1000).toISOString(),
       });
     }
-
     const { data: history } = conversationId
-      ? await supabase
-          .from('messages')
-          .select('role, content')
-          .eq('conversation_id', conversationId)
-          .order('created_at', { ascending: true })
-          .limit(12)
+      ? await supabase.from('messages').select('role, content').eq('conversation_id', conversationId).order('created_at', { ascending: true }).limit(12)
       : { data: [] };
-
     const aiMessages = [
       { role: 'system' as const, content: MAYA_SYSTEM_PROMPT },
-      ...(history || []).map((m: { role: string; content: string }) => ({
-        role: m.role as 'user' | 'assistant',
-        content: m.content,
-      })),
+      ...(history || []).map((m: { role: string; content: string }) => ({ role: m.role as 'user' | 'assistant', content: m.content })),
     ];
-
     let aiReply = "I'm having some trouble right now. Please contact our team directly. Thank you!";
-
     try {
       const aiRes = await fetch('https://openrouter.ai/api/v1/chat/completions', {
         method: 'POST',
         headers: {
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+          Authorization: 'Bearer ' + OPENROUTER_API_KEY,
           'Content-Type': 'application/json',
-          'HTTP-Referer': 'https://whatsapp-maya-agent.vercel.app',
+          'HTTP-Referer': 'https://theempirestayys.online',
           'X-Title': 'Maya - The Empire Stays',
         },
-        body: JSON.stringify({
-          model: AI_MODEL,
-          messages: aiMessages,
-          max_tokens: 400,
-          temperature: 0.7,
-        }),
+        body: JSON.stringify({ model: AI_MODEL, messages: aiMessages, max_tokens: 400, temperature: 0.7 }),
       });
       const aiData = await aiRes.json();
       const c = aiData?.choices?.[0]?.message?.content;
       if (c?.trim()) aiReply = c.trim();
-    } catch (e) {
-      console.error('AI error:', e);
-    }
-
+    } catch (e) { console.error('[Maya] AI error:', e); }
     if (conversationId) {
       await supabase.from('messages').insert({
         conversation_id: conversationId,
+        phone_number: from,
         role: 'assistant',
         content: aiReply,
         created_at: new Date().toISOString(),
       });
-      await supabase
-        .from('conversations')
-        .update({
-          last_message_at: new Date().toISOString(),
-          updated_at: new Date().toISOString(),
-        })
+      await supabase.from('conversations')
+        .update({ last_message_at: new Date().toISOString(), updated_at: new Date().toISOString() })
         .eq('id', conversationId);
     }
-
     await sendWhatsAppMessage(from, aiReply);
     return NextResponse.json({ status: 'ok' });
   } catch (error) {
-    console.error('Webhook error:', error);
+    console.error('[Maya] Webhook error:', error);
     return NextResponse.json({ status: 'error' }, { status: 200 });
   }
 }
 
 async function sendWhatsAppMessage(to: string, text: string): Promise<void> {
-  await fetch(
-    `https://graph.facebook.com/v19.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        to,
-        type: 'text',
-        text: { body: text },
-      }),
-    }
-  );
+  await fetch('https://graph.facebook.com/v19.0/' + WHATSAPP_PHONE_NUMBER_ID + '/messages', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + WHATSAPP_ACCESS_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messaging_product: 'whatsapp', to, type: 'text', text: { body: text } }),
+  });
 }
 
 async function markMessageRead(messageId: string): Promise<void> {
-  await fetch(
-    `https://graph.facebook.com/v19.0/${WHATSAPP_PHONE_NUMBER_ID}/messages`,
-    {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${WHATSAPP_ACCESS_TOKEN}`,
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify({
-        messaging_product: 'whatsapp',
-        status: 'read',
-        message_id: messageId,
-      }),
-    }
-  );
-          }
+  await fetch('https://graph.facebook.com/v19.0/' + WHATSAPP_PHONE_NUMBER_ID + '/messages', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + WHATSAPP_ACCESS_TOKEN, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ messaging_product: 'whatsapp', status: 'read', message_id: messageId }),
+  });
+}
